@@ -4,7 +4,10 @@
  * targets are resolved once and cached so diamond references share a
  * result; a target still being resolved when it's referenced again is a
  * genuine cycle, so that occurrence is left unresolved to avoid recursing
- * forever.
+ * forever. Non-local refs (external files, URLs) are left unresolved too,
+ * since there's nothing in `document` to resolve them against — real-world
+ * documents sometimes use these in vendor extensions unrelated to the
+ * schemas this library cares about.
  */
 export function resolveRefs<T>(document: T): T {
   const root = document as unknown;
@@ -34,6 +37,9 @@ export function resolveRefs<T>(document: T): T {
       const ref = obj['$ref'];
 
       if (typeof ref === 'string') {
+        if (!ref.startsWith('#/')) {
+          return obj;
+        }
         const target = resolvePointer(ref);
         if (!target || typeof target !== 'object') {
           return target;

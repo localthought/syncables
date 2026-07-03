@@ -59,4 +59,19 @@ describe('resolveRefs', () => {
     // so the whole structure stays plain-object-shaped and serializable.
     expect(() => JSON.stringify(resolved)).not.toThrow();
   });
+
+  it('leaves a non-local ref (external file/URL) unresolved instead of throwing', () => {
+    // Real-world documents sometimes put these in vendor extensions unrelated
+    // to any schema this library cares about, e.g. Spotify's OpenAPI document
+    // has `x-spotify-policy: { $ref: '../policies.yaml' }`.
+    const document = {
+      'x-vendor-policy': { $ref: '../policies.yaml' },
+      target: { type: 'string' },
+    };
+
+    const resolved = resolveRefs(document);
+
+    expect(resolved['x-vendor-policy']).toEqual({ $ref: '../policies.yaml' });
+    expect(resolved.target).toEqual({ type: 'string' });
+  });
 });
