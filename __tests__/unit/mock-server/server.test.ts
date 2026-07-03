@@ -67,4 +67,40 @@ describe('createMockServer', () => {
     expect(response.status).toBe(200);
     expect(body).toEqual({ status: 'ok' });
   });
+
+  it('serves an ETag and Last-Modified for a collection, and 304s when unchanged', async () => {
+    const first = await fetch(`${baseUrl}/pets`);
+    const etag = first.headers.get('etag');
+    const lastModified = first.headers.get('last-modified');
+    expect(etag).toBeTruthy();
+    expect(lastModified).toBeTruthy();
+
+    const conditional = await fetch(`${baseUrl}/pets`, {
+      headers: { 'If-None-Match': etag ?? '' },
+    });
+    expect(conditional.status).toBe(304);
+    expect(await conditional.text()).toBe('');
+
+    const byDate = await fetch(`${baseUrl}/pets`, {
+      headers: { 'If-Modified-Since': lastModified ?? '' },
+    });
+    expect(byDate.status).toBe(304);
+  });
+
+  it('bumps the ETag and stops returning 304 once the collection changes', async () => {
+    const first = await fetch(`${baseUrl}/pets`);
+    const etag = first.headers.get('etag');
+
+    await fetch(`${baseUrl}/pets`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'Whiskers', tag: 'cat' }),
+    });
+
+    const second = await fetch(`${baseUrl}/pets`, {
+      headers: { 'If-None-Match': etag ?? '' },
+    });
+    expect(second.status).toBe(200);
+    expect(second.headers.get('etag')).not.toBe(etag);
+  });
 });

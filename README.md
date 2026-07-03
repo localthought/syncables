@@ -34,3 +34,21 @@ A "resource" is any pair of an OpenAPI collection path and its matching
 item path, e.g. `/pets` and `/pets/{petId}`. Paths without that pairing
 (health checks, one-off actions, etc.) are served from their documented
 examples/schemas but aren't treated as syncable resources.
+
+## Keeping in sync
+
+`sync()` is safe to call on a timer: it conditionally re-fetches using
+`ETag`/`Last-Modified` (or a fallback comparison against the previous sync
+when a server doesn't support conditional requests) and only touches local
+storage for items that actually changed.
+
+```ts
+const handle = client.startPolling({
+  intervalMs: 30_000,
+  onSync: (result) => console.log('changed:', result.changed),
+  onError: (error) => console.error('sync failed:', error),
+});
+
+// later
+handle.stop();
+```

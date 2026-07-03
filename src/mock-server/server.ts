@@ -141,7 +141,7 @@ async function handleRequest(
   }
 
   if (resource?.collectionPath === match.template) {
-    handleCollectionRequest(method, resource, operation, store, body, res);
+    handleCollectionRequest(req, method, resource, operation, store, body, res);
     return;
   }
 
@@ -194,6 +194,7 @@ function handleItemRequest(
 }
 
 function handleCollectionRequest(
+  req: IncomingMessage,
   method: string,
   resource: ResourceRoute,
   operation: OperationObject,
@@ -203,7 +204,15 @@ function handleCollectionRequest(
 ): void {
   if (method === 'get') {
     seedIfEmpty(resource, operation, store);
-    sendJson(res, 200, store.list(resource.collectionPath));
+    const etag = store.etag(resource.collectionPath);
+    const lastModified = store.lastModified(resource.collectionPath);
+    const headers = conditionalResponseHeaders(etag, lastModified);
+    if (isNotModified(req, etag, lastModified)) {
+      res.writeHead(304, headers);
+      res.end();
+      return;
+    }
+    sendJson(res, 200, store.list(resource.collectionPath), headers);
     return;
   }
 
@@ -461,12 +470,64 @@ async function readJsonBody(
   }
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   if (body === undefined) {
-    res.writeHead(status);
+    res.writeHead(status, extraHeaders);
     res.end();
     return;
   }
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    ...extraHeaders,
+  });
   res.end(JSON.stringify(body));
+}
+
+function conditionalResponseHeaders(
+  etag: string | undefined,
+  lastModified: string | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (etag) {
+    headers['ETag'] = etag;
+  }
+  if (lastModified) {
+    headers['Last-Modified'] = lastModified;
+  }
+  return headers;
+}
+
+/**
+ * Per RFC 7232 §3.3, If-None-Match takes precedence over If-Modified-Since
+ * when both are present.
+ */
+function isNotModified(
+  req: IncomingMessage,
+  etag: string | undefined,
+  lastModified: string | undefined,
+): boolean {
+  const ifNoneMatch = firstHeaderValue(req.headers['if-none-match']);
+  if (ifNoneMatch) {
+    return etag !== undefined && ifNoneMatch === etag;
+  }
+
+  const ifModifiedSince = firstHeaderValue(req.headers['if-modified-since']);
+  if (ifModifiedSince && lastModified) {
+    const since = new Date(ifModifiedSince).getTime();
+    const modified = new Date(lastModified).getTime();
+    return !Number.isNaN(since) && !Number.isNaN(modified) && modified <= since;
+  }
+
+  return false;
+}
+
+function firstHeaderValue(
+  value: string | string[] | undefined,
+): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
 }

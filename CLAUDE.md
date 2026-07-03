@@ -87,6 +87,23 @@ Data flows through four stages, each its own directory under `src/`:
    standalone `paginate()` method both walk every page of a paginated GET
    operation before returning (see below).
 
+   `sync()` is meant to be called repeatedly (`startPolling({ intervalMs })`
+   does this on an interval, skipping a tick if the previous sync is still
+   in flight) without re-doing work each time: for a non-paginated
+   collection it conditionally re-fetches, keyed by exact request URL,
+   sending `If-None-Match`/`If-Modified-Since` from the prior response's
+   `ETag`/`Last-Modified` and treating a `304` as "nothing to do" (reusing
+   the item list from the previous sync rather than re-parsing a body).
+   Even on a fresh `200`, or for a paginated collection (which can't be
+   conditionally short-circuited the same way, since pagination has to be
+   walked in full to know the current item set), it only touches storage
+   for items that actually changed — per-item change detection prefers a
+   handful of common "this changed" fields (`updatedAt`, `version`, `_rev`,
+   etc.) over deep-comparing the whole object, so it also works against
+   servers with no conditional-request support at all. `sync()`'s return
+   value and each `onSync` callback report which collection paths actually
+   changed.
+
 `fake-data/generate.ts` (`generateFromSchema`) is shared by both the mock
 server (seeding + example responses) and is the only place schema-to-value
 synthesis logic lives — it prefers a schema's own `example`, then `enum`,

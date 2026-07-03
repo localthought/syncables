@@ -1,8 +1,14 @@
+interface CollectionMeta {
+  version: number;
+  lastModified: string;
+}
+
 export class ResourceStore {
   private readonly collections = new Map<
     string,
     Map<string, Record<string, unknown>>
   >();
+  private readonly meta = new Map<string, CollectionMeta>();
 
   has(resource: string): boolean {
     return this.collections.has(resource);
@@ -18,10 +24,34 @@ export class ResourceStore {
 
   put(resource: string, id: string, value: Record<string, unknown>): void {
     this.collection(resource).set(id, value);
+    this.touch(resource);
   }
 
   delete(resource: string, id: string): boolean {
-    return this.collection(resource).delete(id);
+    const deleted = this.collection(resource).delete(id);
+    if (deleted) {
+      this.touch(resource);
+    }
+    return deleted;
+  }
+
+  /** Weak ETag for the current state of `resource`'s collection, once it has been populated at least once. */
+  etag(resource: string): string | undefined {
+    const meta = this.meta.get(resource);
+    return meta ? `W/"${meta.version}"` : undefined;
+  }
+
+  /** RFC 7231 HTTP-date of the last mutation to `resource`'s collection, if any. */
+  lastModified(resource: string): string | undefined {
+    return this.meta.get(resource)?.lastModified;
+  }
+
+  private touch(resource: string): void {
+    const current = this.meta.get(resource);
+    this.meta.set(resource, {
+      version: (current?.version ?? 0) + 1,
+      lastModified: new Date().toUTCString(),
+    });
   }
 
   private collection(resource: string): Map<string, Record<string, unknown>> {

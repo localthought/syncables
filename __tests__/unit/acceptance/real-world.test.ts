@@ -115,7 +115,8 @@ describe('acceptance: spotify.com (apis.guru)', () => {
     // Unlike some real-world APIs (see e.g. Trello, where every collection
     // path only supports POST), Spotify's read endpoints all support GET on
     // both the collection and item path, so a full sync succeeds here.
-    await expect(client.sync()).resolves.toBeUndefined();
+    const result = await client.sync();
+    expect(result.changed.sort()).toEqual(client.resources.slice().sort());
 
     for (const resource of client.resources) {
       const items = await client.list(resource);
