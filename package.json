@@ -1,14 +1,26 @@
 {
-  "name": "node-typescript-boilerplate",
-  "version": "0.0.0",
-  "description": "Minimalistic boilerplate to quick-start Node.js development in TypeScript.",
+  "name": "syncables",
+  "version": "0.1.0",
+  "description": "Reads an OpenAPI document to run a mock API server and a client that syncs a local copy of the API's dataset.",
   "type": "module",
+  "main": "build/src/index.js",
+  "types": "build/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/src/index.d.ts",
+      "default": "./build/src/index.js"
+    }
+  },
+  "files": [
+    "build/src"
+  ],
   "engines": {
     "node": ">= 22.11 < 23"
   },
   "devDependencies": {
     "@eslint/js": "~9.17",
     "@types/eslint__js": "~8.42",
+    "@types/js-yaml": "~4.0",
     "@types/node": "~20",
     "@typescript-eslint/parser": "~8.19",
     "@vitest/coverage-v8": "~2.1",
@@ -24,7 +36,6 @@
     "vitest": "~2.1"
   },
   "scripts": {
-    "start": "NODE_OPTIONS=--enable-source-maps node build/src/main.js",
     "clean": "rimraf coverage build tmp",
     "prebuild": "npm run lint",
     "build": "tsc -p tsconfig.json",
@@ -40,6 +51,7 @@
   "author": "Michiel de Jong <michiel@unhosted.org>",
   "license": "Apache-2.0",
   "dependencies": {
+    "js-yaml": "~4.1",
     "tslib": "~2.8"
   },
   "volta": {
