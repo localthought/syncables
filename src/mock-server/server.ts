@@ -219,10 +219,18 @@ function handleCollectionRequest(
   if (method === 'post') {
     const itemSchema = itemSchemaFor(operation, [201, 200]);
     const generated = generateFromSchema(itemSchema);
+    // Honors a client-supplied id (a common real-world pattern, e.g. a
+    // client-generated UUID primary key) rather than always assigning its
+    // own, so a caller doesn't have to reconcile its own id with a
+    // different server-assigned one.
+    const id =
+      typeof body?.['id'] === 'string' && body['id'] !== ''
+        ? body['id']
+        : randomUUID();
     const record: Record<string, unknown> = {
       ...(generated && typeof generated === 'object' ? generated : {}),
       ...body,
-      id: randomUUID(),
+      id,
     };
     store.put(resource.collectionPath, record['id'] as string, record);
     sendJson(res, 201, record);

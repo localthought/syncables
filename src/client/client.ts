@@ -18,10 +18,20 @@ import { parsePaginationState } from '../pagination/response-parser.js';
 import { locateItemsField } from '../pagination/items.js';
 import { InMemoryStorageAdapter, type StorageAdapter } from './storage.js';
 
+export interface RetryOptions {
+  /** Delay before the first retry of a failed write, in milliseconds. Doubles on each subsequent attempt. Default 200. */
+  baseDelayMs?: number;
+  /** Ceiling for the exponential backoff between retries, in milliseconds. Default 30000. */
+  maxDelayMs?: number;
+  /** Stop auto-retrying a write after this many attempts. Default is unlimited (keep retrying until it succeeds). */
+  maxAttempts?: number;
+}
+
 export interface ApiClientOptions {
   baseUrl: string;
   storage?: StorageAdapter;
   fetch?: typeof fetch;
+  retry?: RetryOptions;
 }
 
 export interface PaginateOptions {
@@ -48,6 +58,25 @@ export interface PollingHandle {
   stop(): void;
 }
 
+export type PendingWriteType = 'create' | 'update' | 'delete';
+
+export interface PendingWriteInfo {
+  resource: string;
+  /** The id the write is filed under locally. For an unsettled `create`, this is the client-generated id, not (yet) whatever the server assigns. */
+  id: string;
+  type: PendingWriteType;
+  /**
+   * How many attempts to reach the server have failed so far. If
+   * `ApiClientOptions.retry.maxAttempts` is set and reached, this stops
+   * growing and the write stops auto-retrying — it stays listed here
+   * (with `lastError` set) until `create`/`update`/`remove` is called
+   * again for the same record.
+   */
+  attempts: number;
+  /** The most recent failure, if at least one attempt has failed. */
+  lastError?: string;
+}
+
 export interface ApiClient {
   resources: string[];
   sync(): Promise<SyncResult>;
@@ -61,16 +90,40 @@ export interface ApiClient {
     resource: string,
     id: string,
   ): Promise<Record<string, unknown> | undefined>;
+  /**
+   * Writes `data` to local storage immediately, under a client-generated id
+   * (or `data.id`, if already set) and returns without waiting on the
+   * network. The write to the server happens in the background and is
+   * retried on failure — see `pendingWrites()` for its outcome so far. If
+   * the server assigns a different id than the one used locally, the
+   * record is moved to it once the write settles.
+   */
   create(
     resource: string,
     data: Record<string, unknown>,
   ): Promise<Record<string, unknown>>;
+  /**
+   * Merges `data` into the local copy of `id` immediately and returns
+   * without waiting on the network; the corresponding `PUT` is sent (and
+   * retried on failure) in the background.
+   */
   update(
     resource: string,
     id: string,
     data: Record<string, unknown>,
   ): Promise<Record<string, unknown>>;
+  /**
+   * Removes `id` from local storage immediately and returns without
+   * waiting on the network; the corresponding `DELETE` is sent (and
+   * retried on failure) in the background.
+   */
   remove(resource: string, id: string): Promise<void>;
+  /**
+   * Writes not yet confirmed by the server, across every resource (or just
+   * `resource`, if given) — local storage already reflects them, but the
+   * background attempt to apply them server-side hasn't succeeded yet.
+   */
+  pendingWrites(resource?: string): PendingWriteInfo[];
   /**
    * Fetches every item from a GET list operation at `path`, walking every
    * page per its resolved pagination scheme (explicit `x-pagination` or
@@ -142,11 +195,37 @@ function extractItemsFromEnvelope(
   return Array.isArray(items) ? (items as Record<string, unknown>[]) : [];
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+  });
+}
+
+interface QueuedWrite {
+  resource: string;
+  id: string;
+  type: PendingWriteType;
+  /** The full record to send; unused for `delete`. */
+  data?: Record<string, unknown>;
+  attempts: number;
+  lastError?: string;
+}
+
+type WriteOutcome =
+  | { status: 'succeeded'; resolvedId: string }
+  | { status: 'retry'; delayMs: number }
+  | { status: 'gaveUp' };
+
 /**
  * Builds a client that talks to an API described by `document` and keeps
  * a local copy of each resource collection in `storage` (in-memory by
- * default). Reads serve from the local copy; writes go to the API first
- * and then update the local copy on success.
+ * default). Reads serve from the local copy. Writes (`create`/`update`/
+ * `remove`) are local-first: they update `storage` immediately and return,
+ * then apply themselves against the server in the background, retrying on
+ * failure — see `pendingWrites()` and each method's own docs.
  */
 export function createApiClient(
   document: OpenApiDocument,
@@ -169,6 +248,144 @@ export function createApiClient(
   // sync, used both to fall back on for a 304 response and to diff against
   // a fresh 200 response (see `hasChanges`).
   const lastSyncedItems = new Map<string, Record<string, unknown>[]>();
+
+  const retryOptions = {
+    baseDelayMs: options.retry?.baseDelayMs ?? 200,
+    maxDelayMs: options.retry?.maxDelayMs ?? 30_000,
+    maxAttempts: options.retry?.maxAttempts,
+  };
+
+  // Keyed by `${resource}:${id}`: writes still to be applied server-side
+  // for that record, oldest first. `drainQueue` processes each key's queue
+  // one write at a time (retrying in place before moving on) so writes to
+  // the same record land in the order they were made.
+  const writeQueues = new Map<string, QueuedWrite[]>();
+  const draining = new Set<string>();
+  // Writes that stopped retrying because `retryOptions.maxAttempts` was
+  // reached (by default retries never give up, so this stays empty).
+  // Kept only so `pendingWrites()` can still surface the failure; enqueuing
+  // a new write for the same record clears it.
+  const gaveUpWrites = new Map<string, QueuedWrite>();
+
+  function queueKey(resource: string, id: string): string {
+    return `${resource}:${id}`;
+  }
+
+  function enqueueWrite(write: Omit<QueuedWrite, 'attempts'>): void {
+    const k = queueKey(write.resource, write.id);
+    gaveUpWrites.delete(k);
+    const queue = writeQueues.get(k) ?? [];
+    queue.push({ ...write, attempts: 0 });
+    writeQueues.set(k, queue);
+    if (!draining.has(k)) {
+      void drainQueue(k);
+    }
+  }
+
+  async function attemptWrite(write: QueuedWrite): Promise<WriteOutcome> {
+    try {
+      if (write.type === 'create') {
+        const route = resolveRoute(write.resource);
+        const created = (await requestJson(collectionUrl(route), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(write.data),
+        })) as Record<string, unknown>;
+        const resolvedId = String(created['id']);
+        if (resolvedId !== write.id) {
+          await storage.delete(write.resource, write.id);
+        }
+        await storage.put(write.resource, resolvedId, created);
+        return { status: 'succeeded', resolvedId };
+      }
+
+      if (write.type === 'update') {
+        const route = resolveRoute(write.resource);
+        const updated = (await requestJson(itemUrl(route, write.id), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(write.data),
+        })) as Record<string, unknown>;
+        await storage.put(write.resource, write.id, updated);
+        return { status: 'succeeded', resolvedId: write.id };
+      }
+
+      // A delete may be applying on behalf of a create that already
+      // reconciled onto a server-assigned id (see `drainQueue`), so make
+      // sure local storage doesn't still hold that record either.
+      await storage.delete(write.resource, write.id);
+      const route = resolveRoute(write.resource);
+      await requestJson(itemUrl(route, write.id), { method: 'DELETE' });
+      return { status: 'succeeded', resolvedId: write.id };
+    } catch (error) {
+      write.attempts += 1;
+      write.lastError = error instanceof Error ? error.message : String(error);
+      if (
+        retryOptions.maxAttempts !== undefined &&
+        write.attempts >= retryOptions.maxAttempts
+      ) {
+        return { status: 'gaveUp' };
+      }
+      const delayMs = Math.min(
+        retryOptions.baseDelayMs * 2 ** (write.attempts - 1),
+        retryOptions.maxDelayMs,
+      );
+      return { status: 'retry', delayMs };
+    }
+  }
+
+  /**
+   * Applies queued writes for one record in order, retrying each in place
+   * (per `attemptWrite`'s backoff) before moving to the next. When a
+   * `create` at the head of the queue settles under a server-assigned id
+   * different from its local one, whatever is queued behind it is moved
+   * onto that id's queue instead — those writes were made against the
+   * record the create introduced, so they have to follow it.
+   */
+  async function drainQueue(initialKey: string): Promise<void> {
+    let k = initialKey;
+    draining.add(k);
+    try {
+      for (;;) {
+        const queue = writeQueues.get(k);
+        const write = queue?.[0];
+        if (!write) {
+          writeQueues.delete(k);
+          return;
+        }
+
+        const outcome = await attemptWrite(write);
+        if (outcome.status === 'retry') {
+          await delay(outcome.delayMs);
+          continue;
+        }
+
+        queue.shift();
+        if (outcome.status === 'gaveUp') {
+          gaveUpWrites.set(k, write);
+        }
+        if (outcome.status === 'succeeded' && outcome.resolvedId !== write.id) {
+          const rest = queue.splice(0);
+          writeQueues.delete(k);
+          draining.delete(k);
+          k = queueKey(write.resource, outcome.resolvedId);
+          draining.add(k);
+          const existing = writeQueues.get(k) ?? [];
+          writeQueues.set(k, [
+            ...existing,
+            ...rest.map((item) => ({ ...item, id: outcome.resolvedId })),
+          ]);
+          continue;
+        }
+
+        if (queue.length === 0) {
+          writeQueues.delete(k);
+        }
+      }
+    } finally {
+      draining.delete(k);
+    }
+  }
 
   function resolveRoute(resource: string): ResourceRoute {
     const route = byResource.get(resource);
@@ -483,30 +700,65 @@ export function createApiClient(
 
     async create(resource, data): Promise<Record<string, unknown>> {
       const route = resolveRoute(resource);
-      const created = (await requestJson(collectionUrl(route), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      })) as Record<string, unknown>;
-      await storage.put(route.collectionPath, String(created['id']), created);
-      return created;
+      const id =
+        typeof data['id'] === 'string' ? data['id'] : crypto.randomUUID();
+      const record = { ...data, id };
+      await storage.put(route.collectionPath, id, record);
+      enqueueWrite({
+        resource: route.collectionPath,
+        id,
+        type: 'create',
+        data: record,
+      });
+      return record;
     },
 
     async update(resource, id, data): Promise<Record<string, unknown>> {
       const route = resolveRoute(resource);
-      const updated = (await requestJson(itemUrl(route, id), {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      })) as Record<string, unknown>;
-      await storage.put(route.collectionPath, id, updated);
-      return updated;
+      const existing = await storage.get(route.collectionPath, id);
+      const record = { ...existing, ...data, id };
+      await storage.put(route.collectionPath, id, record);
+      enqueueWrite({
+        resource: route.collectionPath,
+        id,
+        type: 'update',
+        data: record,
+      });
+      return record;
     },
 
     async remove(resource, id): Promise<void> {
       const route = resolveRoute(resource);
-      await requestJson(itemUrl(route, id), { method: 'DELETE' });
       await storage.delete(route.collectionPath, id);
+      enqueueWrite({ resource: route.collectionPath, id, type: 'delete' });
+    },
+
+    pendingWrites(resource): PendingWriteInfo[] {
+      const collectionPath = resource
+        ? resolveRoute(resource).collectionPath
+        : undefined;
+      const info: PendingWriteInfo[] = [];
+      const collect = (write: QueuedWrite): void => {
+        if (collectionPath && write.resource !== collectionPath) {
+          return;
+        }
+        info.push({
+          resource: write.resource,
+          id: write.id,
+          type: write.type,
+          attempts: write.attempts,
+          ...(write.lastError ? { lastError: write.lastError } : {}),
+        });
+      };
+      for (const queue of writeQueues.values()) {
+        for (const write of queue) {
+          collect(write);
+        }
+      }
+      for (const write of gaveUpWrites.values()) {
+        collect(write);
+      }
+      return info;
     },
 
     async paginate(

@@ -52,3 +52,18 @@ const handle = client.startPolling({
 // later
 handle.stop();
 ```
+
+## Writing
+
+`create`/`update`/`remove` are local-first: they update local storage
+immediately and return, then apply themselves against the server in the
+background, retrying on failure until they succeed.
+
+```ts
+const pet = await client.create('/pets', { name: 'Milo', tag: 'cat' });
+// `pet` is already in local storage — the POST to the server is still
+// happening (and retrying, if needed) in the background.
+
+client.pendingWrites('/pets'); // writes not yet confirmed by the server
+```
+

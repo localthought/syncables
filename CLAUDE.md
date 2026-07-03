@@ -82,10 +82,25 @@ Data flows through four stages, each its own directory under `src/`:
    against the same document to know what resources/routes exist, then talks
    to a live server over `fetch`. Reads are served from local storage
    (`StorageAdapter`, `storage.ts`; `InMemoryStorageAdapter` is the default —
-   pass a custom adapter to persist elsewhere), writes go to the server first
-   and update local storage only after the server confirms. `sync()` and the
-   standalone `paginate()` method both walk every page of a paginated GET
-   operation before returning (see below).
+   pass a custom adapter to persist elsewhere). `sync()` and the standalone
+   `paginate()` method both walk every page of a paginated GET operation
+   before returning (see below).
+
+   `create`/`update`/`remove` are local-first: each writes to `storage`
+   immediately and returns without waiting on the network, then applies
+   itself against the server in the background via a per-record write
+   queue (keyed by `${resource}:${id}`, one write in flight at a time so
+   writes to the same record land in server order), retrying failures with
+   exponential backoff (`ApiClientOptions.retry`; unlimited attempts by
+   default). `create` generates a local id up front (`crypto.randomUUID()`,
+   or whatever `data.id` already is) so the record exists locally before
+   any request is sent; if the server assigns a different id, the record —
+   and anything still queued behind that create — is moved onto it once
+   the write settles (the mock server instead honors a client-supplied id
+   when present, which is common enough in real APIs that this rarely
+   triggers). `pendingWrites()` reports writes not yet confirmed by the
+   server, including the last error and attempt count for ones currently
+   failing.
 
    `sync()` is meant to be called repeatedly (`startPolling({ intervalMs })`
    does this on an interval, skipping a tick if the previous sync is still
