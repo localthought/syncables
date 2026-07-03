@@ -106,6 +106,9 @@ describe('createApiClient conditional sync', () => {
 
     await new Promise((resolve) => setTimeout(resolve, 90));
     handle.stop();
+    // stop() doesn't cancel a sync already in flight when it's called, so
+    // give one a moment to land before treating the count as final.
+    await new Promise((resolve) => setTimeout(resolve, 30));
     const countAfterStop = results.length;
 
     await new Promise((resolve) => setTimeout(resolve, 50));
