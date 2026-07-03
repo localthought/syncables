@@ -197,7 +197,7 @@ export function createApiClient(
         items.push(...(pageItems as Record<string, unknown>[]));
       }
 
-      const state = parsePaginationState(scheme, body, headers);
+      const state = parsePaginationState(scheme, body, headers, items.length);
       if (!state.hasNextPage) {
         break;
       }

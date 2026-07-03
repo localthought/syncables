@@ -21,6 +21,12 @@ import type { OpenApiDocument } from '../../../src/openapi/types.js';
  * (/gifs, /albums, ...) aren't the paginated ones; pagination is a
  * property of list/search operations, which is orthogonal to this
  * library's collection+item resource model.
+ *
+ * Giphy's overlay originally declared an invalid `type: offset` (offset is
+ * a role, not a scheme type) and reused that same invalid value as a
+ * response role; this was fixed upstream in
+ * https://github.com/localthought/overlays/pull/139, and the vendored copy
+ * here reflects that fix.
  */
 
 function fixturePath(name: string): string {
@@ -42,45 +48,54 @@ describe('acceptance: pagination extension on giphy.com', () => {
   let document: OpenApiDocument;
   let server: MockServer;
   let client: ApiClient;
+  let baseUrl: string;
 
   beforeAll(async () => {
     document = await loadWithOverlay('giphy.yaml', 'giphy-pagination-overlay.yaml');
     server = createMockServer(document);
     const info = await server.listen();
-    client = createApiClient(document, { baseUrl: info.url });
+    baseUrl = info.url;
+    client = createApiClient(document, { baseUrl });
   });
 
   afterAll(() => server.close());
 
-  it('applies the overlay, adding a paginationSchemes entry', () => {
-    expect(document.components?.paginationSchemes).toHaveProperty('offset');
-  });
-
-  it("rejects Giphy's own scheme as spec-invalid", () => {
+  it('applies the overlay, adding a valid paginationSchemes entry', () => {
     const scheme = document.components?.paginationSchemes?.['offset'];
     expect(scheme).toBeDefined();
-    const errors = validatePaginationScheme('offset', scheme!);
-
-    // The vendored overlay declares `type: offset`, but the spec only
-    // allows pageNumber | pageToken | nextLink (offset is a *role*, not a
-    // scheme type) — and reuses that same invalid value as a *response*
-    // role, which isn't valid there either (offset is request-only).
-    expect(errors).toEqual([
-      expect.stringContaining('type must be one of pageNumber, pageToken, or nextLink'),
-      expect.stringContaining('response.bodyFields.pagination.offset.role is not a valid response role'),
-    ]);
+    expect(validatePaginationScheme('offset', scheme!)).toEqual([]);
   });
 
-  it('falls back to single-page behavior since no valid scheme applies', async () => {
-    // /gifs/trending is a genuinely paginated real endpoint (has limit and
-    // offset query parameters, a clean response schema), but because the
-    // only declared scheme is invalid, pagination doesn't engage here:
-    // the mock server serves it as a plain documented-example response
-    // (one generated Gif), and the client's best-effort item extraction
-    // still unwraps the `data` envelope, returning that single item.
-    const items = await client.paginate('/gifs/trending');
-    expect(items).toHaveLength(1);
-    expect(items[0]).toHaveProperty('id');
+  it('traverses every page of a real paginated list endpoint', async () => {
+    // /gifs/trending is not one of the collection/item "resources"
+    // discovered elsewhere (it has no sibling item route) — it's a plain
+    // list operation matched purely by its pagination scheme. With
+    // pageSize 3 and the mock server's fixed 7-item dataset, this requires
+    // three requests (3 + 3 + 1) to fully traverse.
+    const items = await client.paginate('/gifs/trending', { pageSize: 3 });
+
+    expect(items).toHaveLength(7);
+    const ids = items.map((item) => item['id']);
+    expect(new Set(ids).size).toBe(7);
+  });
+
+  it('reports accurate pagination metadata across pages', async () => {
+    // Giphy's scheme declares totalCount/pageSize under a nested
+    // "pagination" object (dotted bodyFields paths), and no currentPage
+    // role at all — hasNextPage for this scheme is derived purely from
+    // totalCount vs. items fetched so far, not page counting.
+    const firstResponse = await fetch(`${baseUrl}/gifs/trending?limit=3&offset=0`);
+    const firstPage = (await firstResponse.json()) as Record<string, unknown>;
+    const firstPagination = firstPage['pagination'] as Record<string, unknown>;
+    expect(firstPagination['total_count']).toBe(7);
+    expect(firstPagination['count']).toBe(3);
+
+    const lastResponse = await fetch(`${baseUrl}/gifs/trending?limit=3&offset=6`);
+    const lastPage = (await lastResponse.json()) as Record<string, unknown>;
+    const lastPagination = lastPage['pagination'] as Record<string, unknown>;
+    expect(lastPagination['total_count']).toBe(7);
+    expect(lastPagination['count']).toBe(1);
+    expect((lastPage['data'] as unknown[]).length).toBe(1);
   });
 });
 

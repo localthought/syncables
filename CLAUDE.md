@@ -150,10 +150,13 @@ Tests under `__tests__/unit/` mirror this `src/` layout one-to-one (e.g.
   (see the header comment in each file for provenance). `acceptance/*.test.ts`
   runs the full pipeline against these and deliberately documents real
   quirks rather than working around them — e.g. an enveloped (non-array)
-  collection response, a 405 on a collection that only supports `POST`, or
-  a vendored pagination overlay whose scheme fails the extension's own
-  validation. When extending these, keep that spirit: assert what actually
-  happens against the unmodified real document, not an idealized result.
+  collection response, or a 405 on a collection that only supports `POST`.
+  When extending these, keep that spirit: assert what actually happens
+  against the unmodified real document, not an idealized result. (Giphy's
+  overlay originally failed the extension's own validation — `type: offset`
+  isn't a valid scheme type — which was fixed upstream in
+  https://github.com/localthought/overlays/pull/139; the vendored copy
+  reflects that fix.)
 
 ## Conventions
 

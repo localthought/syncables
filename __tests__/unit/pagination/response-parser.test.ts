@@ -77,6 +77,26 @@ describe('parsePaginationState', () => {
     ).toBe(false);
   });
 
+  it('derives hasNextPage from totalCount vs. items fetched so far, with no currentPage role at all', () => {
+    // Mirrors Giphy's real scheme: totalCount + pageSize are reported, but
+    // there's no currentPage/totalPages role to count pages from, so the
+    // caller's own running item count is what determines hasNextPage.
+    const scheme: PaginationSchemeObject = {
+      type: 'pageNumber',
+      response: { bodyFields: { total_count: { role: 'totalCount' } } },
+    };
+    expect(
+      parsePaginationState(scheme, { total_count: 7 }, {}, 3).hasNextPage,
+    ).toBe(true);
+    expect(
+      parsePaginationState(scheme, { total_count: 7 }, {}, 7).hasNextPage,
+    ).toBe(false);
+    // Without itemsFetchedSoFar, totalCount alone isn't enough to tell.
+    expect(
+      parsePaginationState(scheme, { total_count: 7 }).hasNextPage,
+    ).toBe(false);
+  });
+
   it('parses a nextLink from a response header, not just the body', () => {
     const scheme: PaginationSchemeObject = {
       type: 'nextLink',

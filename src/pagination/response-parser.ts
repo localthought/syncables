@@ -120,13 +120,24 @@ function extractByRole(
  * type-specific counting rules, means traversal still terminates
  * correctly for those schemes even without a `currentPage`/`totalPages`
  * role declared.
+ *
+ * `totalCount` (role: `all` per spec §4.5) is checked next against
+ * `itemsFetchedSoFar`, which the *caller* tracks — some real schemes
+ * (e.g. Giphy's) report `totalCount` and `pageSize` but no `currentPage`
+ * at all, so there's nothing here to compute "current page * pageSize"
+ * from; the client already knows exactly how many items it has pulled
+ * across all pages so far, which is the more direct signal anyway.
  */
 function deriveHasNextPage(
   type: SchemeType,
   state: PaginationResponseState,
+  itemsFetchedSoFar?: number,
 ): boolean {
   if (state.nextLink !== null || state.nextPageToken !== null) {
     return true;
+  }
+  if (state.totalCount !== null && itemsFetchedSoFar !== undefined) {
+    return itemsFetchedSoFar < state.totalCount;
   }
   if (type === 'pageNumber') {
     if (state.currentPage !== null && state.totalPages !== null) {
@@ -143,11 +154,17 @@ function deriveHasNextPage(
   return false;
 }
 
-/** Parses a server response into pagination state, per the resolved scheme. */
+/**
+ * Parses a server response into pagination state, per the resolved scheme.
+ * `itemsFetchedSoFar` — the cumulative item count across all pages
+ * fetched so far, including this one — lets `hasNextPage` be derived from
+ * a plain `totalCount` field even when no `currentPage` role is declared.
+ */
 export function parsePaginationState(
   scheme: PaginationSchemeObject,
   body: Record<string, unknown>,
   headers: Record<string, string> = {},
+  itemsFetchedSoFar?: number,
 ): PaginationResponseState {
   const roles = extractByRole(scheme, body, headers);
 
@@ -162,6 +179,6 @@ export function parsePaginationState(
     pageSize: toNumberOrNull(roles.get('pageSize') ?? null),
     hasNextPage: false,
   };
-  state.hasNextPage = deriveHasNextPage(scheme.type, state);
+  state.hasNextPage = deriveHasNextPage(scheme.type, state, itemsFetchedSoFar);
   return state;
 }
