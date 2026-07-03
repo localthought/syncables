@@ -2,13 +2,27 @@ import {
   discoverResources,
   type ResourceRoute,
 } from '../resources/discover.js';
-import type { OpenApiDocument } from '../openapi/types.js';
+import type { OpenApiDocument, OperationObject } from '../openapi/types.js';
+import { findRoute } from '../routing/router.js';
+import { resolveEffectiveScheme } from '../pagination/autodetect.js';
+import {
+  buildQuery,
+  nextCursor,
+  type PageCursor,
+} from '../pagination/request-builder.js';
+import { parsePaginationState } from '../pagination/response-parser.js';
+import { locateItemsField } from '../pagination/items.js';
 import { InMemoryStorageAdapter, type StorageAdapter } from './storage.js';
 
 export interface ApiClientOptions {
   baseUrl: string;
   storage?: StorageAdapter;
   fetch?: typeof fetch;
+}
+
+export interface PaginateOptions {
+  /** Page size to request. Falls back to the server's own default when omitted. */
+  pageSize?: number;
 }
 
 export interface ApiClient {
@@ -29,7 +43,20 @@ export interface ApiClient {
     data: Record<string, unknown>,
   ): Promise<Record<string, unknown>>;
   remove(resource: string, id: string): Promise<void>;
+  /**
+   * Fetches every item from a GET list operation at `path`, walking every
+   * page per its resolved pagination scheme (explicit `x-pagination` or
+   * auto-detected from `components.paginationSchemes`). `path` need not be
+   * a discovered resource — any GET operation in the document works, e.g.
+   * a search/listing endpoint with no paired item route.
+   */
+  paginate(
+    path: string,
+    options?: PaginateOptions,
+  ): Promise<Record<string, unknown>[]>;
 }
+
+const MAX_PAGES = 50;
 
 /**
  * Builds a client that talks to an API described by `document` and keeps
@@ -87,15 +114,129 @@ export function createApiClient(
     return text ? JSON.parse(text) : undefined;
   }
 
+  async function requestJsonWithHeaders(url: string): Promise<{
+    body: Record<string, unknown>;
+    headers: Record<string, string>;
+  }> {
+    const response = await fetchImpl(url);
+    if (!response.ok) {
+      throw new Error(
+        `Request to ${url} failed with status ${response.status}`,
+      );
+    }
+    const text = await response.text();
+    const parsed = text ? JSON.parse(text) : {};
+    const headers: Record<string, string> = {};
+    response.headers.forEach((value, key) => {
+      headers[key] = value;
+    });
+    return {
+      body: parsed && typeof parsed === 'object' ? parsed : {},
+      headers,
+    };
+  }
+
+  function findGetOperation(
+    path: string,
+  ): { operation: OperationObject; template: string } | undefined {
+    const match = findRoute(Object.keys(document.paths), path);
+    if (!match) {
+      return undefined;
+    }
+    const operation = document.paths[match.template]?.get;
+    return operation ? { operation, template: match.template } : undefined;
+  }
+
+  /**
+   * Fetches every item from a GET operation, following its resolved
+   * pagination scheme across pages. When no scheme applies, falls back to
+   * a single request, still attempting to locate the items in an
+   * enveloped (non-array) response body.
+   */
+  async function fetchAllItems(
+    path: string,
+    operation: OperationObject,
+    pageSize: number | undefined,
+  ): Promise<Record<string, unknown>[]> {
+    const responseSchema =
+      operation.responses['200']?.content?.['application/json']?.schema;
+    const effective = resolveEffectiveScheme(document, operation);
+
+    if (!effective) {
+      const { body } = await requestJsonWithHeaders(
+        new URL(path, options.baseUrl).toString(),
+      );
+      if (Array.isArray(body)) {
+        return body as Record<string, unknown>[];
+      }
+      const field = locateItemsField(responseSchema, undefined);
+      const items = field ? body[field] : undefined;
+      return Array.isArray(items) ? (items as Record<string, unknown>[]) : [];
+    }
+
+    const { scheme } = effective;
+    const itemsField = locateItemsField(responseSchema, scheme);
+    const items: Record<string, unknown>[] = [];
+    let cursor: PageCursor = {};
+    let nextUrl: string | undefined;
+
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      let url = nextUrl;
+      if (!url) {
+        const target = new URL(path, options.baseUrl);
+        const query = buildQuery(scheme, cursor, pageSize);
+        for (const [key, value] of Object.entries(query)) {
+          target.searchParams.set(key, value);
+        }
+        url = target.toString();
+      }
+
+      const { body, headers } = await requestJsonWithHeaders(url);
+      const pageItems = itemsField ? body[itemsField] : undefined;
+      if (Array.isArray(pageItems)) {
+        items.push(...(pageItems as Record<string, unknown>[]));
+      }
+
+      const state = parsePaginationState(scheme, body, headers);
+      if (!state.hasNextPage) {
+        break;
+      }
+
+      if (scheme.type === 'nextLink') {
+        if (!state.nextLink) {
+          break;
+        }
+        nextUrl = state.nextLink;
+      } else {
+        const next = nextCursor(
+          scheme,
+          cursor,
+          state,
+          Array.isArray(pageItems) ? pageItems.length : 0,
+        );
+        if (!next) {
+          break;
+        }
+        cursor = next;
+        nextUrl = undefined;
+      }
+    }
+
+    return items;
+  }
+
   return {
     resources: [...byResource.keys()],
 
     async sync(): Promise<void> {
       for (const route of byResource.values()) {
-        const items = (await requestJson(collectionUrl(route))) as
-          | Record<string, unknown>[]
-          | undefined;
-        for (const item of items ?? []) {
+        const operation = document.paths[route.collectionPath]?.get;
+        const items = operation
+          ? await fetchAllItems(route.collectionPath, operation, undefined)
+          : (((await requestJson(collectionUrl(route))) as
+              | Record<string, unknown>[]
+              | undefined) ?? []);
+        for (const item of items) {
           await storage.put(route.collectionPath, String(item['id']), item);
         }
       }
@@ -135,6 +276,17 @@ export function createApiClient(
       const route = resolveRoute(resource);
       await requestJson(itemUrl(route, id), { method: 'DELETE' });
       await storage.delete(route.collectionPath, id);
+    },
+
+    async paginate(
+      path,
+      paginateOptions = {},
+    ): Promise<Record<string, unknown>[]> {
+      const found = findGetOperation(path);
+      if (!found) {
+        throw new Error(`No GET operation found for path "${path}"`);
+      }
+      return fetchAllItems(path, found.operation, paginateOptions.pageSize);
     },
   };
 }

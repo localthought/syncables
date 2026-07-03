@@ -15,7 +15,16 @@ import type {
   OperationObject,
   SchemaObject,
 } from '../openapi/types.js';
-import { findRoute } from './router.js';
+import { findRoute } from '../routing/router.js';
+import {
+  resolveEffectiveScheme,
+  type EffectiveScheme,
+} from '../pagination/autodetect.js';
+import {
+  itemSchemaFor as paginationItemSchemaFor,
+  locateItemsField,
+} from '../pagination/items.js';
+import { setNestedField } from '../pagination/response-parser.js';
 import { ResourceStore } from './store.js';
 
 export interface MockServer {
@@ -24,6 +33,10 @@ export interface MockServer {
 }
 
 const SEED_COUNT = 3;
+/** Total fake items generated for a paginated list endpoint, once per path template. */
+const PAGINATED_TOTAL_COUNT = 7;
+/** Page size used when the request doesn't specify one. */
+const DEFAULT_PAGE_SIZE = 3;
 
 export function createMockServer(document: OpenApiDocument): MockServer {
   const paths = document.paths as unknown as Record<
@@ -32,8 +45,17 @@ export function createMockServer(document: OpenApiDocument): MockServer {
   >;
   const resources = discoverResources(paths);
   const store = new ResourceStore();
+  const paginatedLists = new Map<string, Record<string, unknown>[]>();
   const server: Server = createServer((req, res) => {
-    handleRequest(req, res, paths, resources, store).catch((error: unknown) => {
+    handleRequest(
+      req,
+      res,
+      document,
+      paths,
+      resources,
+      store,
+      paginatedLists,
+    ).catch((error: unknown) => {
       sendJson(res, 500, { error: String(error) });
     });
   });
@@ -60,11 +82,18 @@ export function createMockServer(document: OpenApiDocument): MockServer {
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
+  document: OpenApiDocument,
   paths: Record<string, Record<string, OperationObject | undefined>>,
   resources: ResourceRoute[],
   store: ResourceStore,
+  paginatedLists: Map<string, Record<string, unknown>[]>,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', 'http://localhost');
+  // Real absolute base (not a placeholder), needed to build working
+  // nextLink URLs for paginated responses.
+  const url = new URL(
+    req.url ?? '/',
+    `http://${req.headers.host ?? 'localhost'}`,
+  );
   const method = (req.method ?? 'GET').toLowerCase();
   const match = findRoute(Object.keys(paths), url.pathname);
 
@@ -77,6 +106,21 @@ async function handleRequest(
   if (!operation) {
     sendJson(res, 405, { error: 'Method Not Allowed' });
     return;
+  }
+
+  if (method === 'get') {
+    const effective = resolveEffectiveScheme(document, operation);
+    if (effective) {
+      handlePaginatedListRequest(
+        match.template,
+        operation,
+        effective,
+        url,
+        paginatedLists,
+        res,
+      );
+      return;
+    }
   }
 
   const body =
@@ -177,6 +221,158 @@ function handleCollectionRequest(
   }
 
   sendJson(res, 405, { error: 'Method Not Allowed' });
+}
+
+function fieldNameForRole(
+  scheme: EffectiveScheme['scheme'],
+  role: string,
+): string | undefined {
+  const entry = Object.entries(scheme.request?.queryParameters ?? {}).find(
+    ([, field]) => field.role === role,
+  );
+  return entry?.[0];
+}
+
+function buildNextLink(
+  url: URL,
+  nextOffset: number,
+  pageSize: number,
+  offsetParam: string | undefined,
+  pageParam: string | undefined,
+  pageSizeParam: string | undefined,
+): string {
+  const next = new URL(url.toString());
+  if (offsetParam) {
+    next.searchParams.set(offsetParam, String(nextOffset));
+  }
+  if (pageParam) {
+    next.searchParams.set(
+      pageParam,
+      String(Math.floor(nextOffset / pageSize) + 1),
+    );
+  }
+  if (pageSizeParam) {
+    next.searchParams.set(pageSizeParam, String(pageSize));
+  }
+  return next.toString();
+}
+
+/**
+ * Serves a GET operation whose pagination scheme was resolved by
+ * `resolveEffectiveScheme`: generates a fixed-size fake dataset once per
+ * path template, slices it according to the request's pagination
+ * parameters, and reports accurate metadata at the scheme's declared
+ * (possibly nested) response fields.
+ */
+function handlePaginatedListRequest(
+  pathTemplate: string,
+  operation: OperationObject,
+  effective: EffectiveScheme,
+  url: URL,
+  paginatedLists: Map<string, Record<string, unknown>[]>,
+  res: ServerResponse,
+): void {
+  const { scheme } = effective;
+  const responseSchema = responseSchemaFor(operation, [200]);
+
+  let items = paginatedLists.get(pathTemplate);
+  if (!items) {
+    const itemSchema = paginationItemSchemaFor(responseSchema, scheme);
+    items = Array.from({ length: PAGINATED_TOTAL_COUNT }, () => {
+      const generated = generateFromSchema(itemSchema);
+      // generateFromSchema prefers a schema's own `example` when present,
+      // which is great for a single realistic value but means every
+      // generated item would otherwise share the exact same id (e.g.
+      // Spotify's SimplifiedAlbumObject.id has a fixed example) — so, as
+      // with resource seeding below, each item gets its own fresh id.
+      return {
+        ...(generated && typeof generated === 'object'
+          ? (generated as Record<string, unknown>)
+          : { value: generated }),
+        id: randomUUID(),
+      };
+    });
+    paginatedLists.set(pathTemplate, items);
+  }
+
+  const offsetParam = fieldNameForRole(scheme, 'offset');
+  const pageParam = fieldNameForRole(scheme, 'page');
+  const pageSizeParam = fieldNameForRole(scheme, 'pageSize');
+  const pageTokenParam =
+    fieldNameForRole(scheme, 'pageToken') ?? fieldNameForRole(scheme, 'cursor');
+
+  const pageSize = pageSizeParam
+    ? Number(url.searchParams.get(pageSizeParam) ?? DEFAULT_PAGE_SIZE)
+    : DEFAULT_PAGE_SIZE;
+
+  let offset = 0;
+  if (offsetParam) {
+    offset = Number(url.searchParams.get(offsetParam) ?? '0');
+  } else if (pageParam) {
+    const page = Number(url.searchParams.get(pageParam) ?? '1');
+    offset = (page - 1) * pageSize;
+  } else if (pageTokenParam) {
+    const token = url.searchParams.get(pageTokenParam);
+    offset = token ? Number(token) : 0;
+  }
+
+  const slice = items.slice(offset, offset + pageSize);
+  const hasMore = offset + pageSize < items.length;
+  const nextOffset = offset + pageSize;
+
+  const generatedBody = generateFromSchema(responseSchema);
+  const body: Record<string, unknown> =
+    generatedBody && typeof generatedBody === 'object'
+      ? (generatedBody as Record<string, unknown>)
+      : {};
+
+  const itemsField = locateItemsField(responseSchema, scheme);
+  if (itemsField) {
+    body[itemsField] = slice;
+  }
+
+  for (const [path, field] of Object.entries(
+    scheme.response?.bodyFields ?? {},
+  )) {
+    switch (field.role) {
+      case 'totalCount':
+        setNestedField(body, path, items.length);
+        break;
+      case 'pageSize':
+        setNestedField(body, path, slice.length);
+        break;
+      case 'currentPage':
+        setNestedField(body, path, Math.floor(offset / pageSize) + 1);
+        break;
+      case 'totalPages':
+        setNestedField(body, path, Math.ceil(items.length / pageSize));
+        break;
+      case 'nextPageToken':
+      case 'nextCursor':
+        setNestedField(body, path, hasMore ? String(nextOffset) : null);
+        break;
+      case 'nextLink':
+        setNestedField(
+          body,
+          path,
+          hasMore
+            ? buildNextLink(
+                url,
+                nextOffset,
+                pageSize,
+                offsetParam,
+                pageParam,
+                pageSizeParam,
+              )
+            : null,
+        );
+        break;
+      default:
+        break;
+    }
+  }
+
+  sendJson(res, 200, body);
 }
 
 function seedIfEmpty(

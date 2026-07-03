@@ -1,3 +1,5 @@
+import type { PaginationSchemesMap } from '../pagination/types.js';
+
 export interface SchemaObject {
   type?: string;
   format?: string;
@@ -28,8 +30,17 @@ export interface RequestBodyObject {
   content?: Record<string, MediaTypeObject>;
 }
 
+export interface ParameterObject {
+  name: string;
+  in: 'query' | 'path' | 'header' | 'cookie';
+  required?: boolean;
+  schema?: SchemaObject;
+  [key: string]: unknown;
+}
+
 export interface OperationObject {
   operationId?: string;
+  parameters?: ParameterObject[];
   requestBody?: RequestBodyObject;
   responses: Record<string, ResponseObject>;
   [key: string]: unknown;
@@ -50,6 +61,8 @@ export interface OpenApiDocument {
   paths: Record<string, PathItem>;
   components?: {
     schemas?: Record<string, SchemaObject>;
+    paginationSchemes?: PaginationSchemesMap;
+    [key: string]: unknown;
   };
   [key: string]: unknown;
 }
