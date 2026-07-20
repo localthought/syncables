@@ -1,6 +1,6 @@
 {
   "name": "syncables",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reads an OpenAPI document to run a mock API server and a client that syncs a local copy of the API's dataset.",
   "type": "module",
   "main": "build/src/index.js",
