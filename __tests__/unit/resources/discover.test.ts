@@ -9,8 +9,31 @@ describe('discoverResources', () => {
     });
 
     expect(resources).toEqual([
-      { collectionPath: '/pets', itemPath: '/pets/{petId}', itemParam: 'petId' },
+      {
+        collectionPath: '/pets',
+        itemPath: '/pets/{petId}',
+        itemParam: 'petId',
+        updateMethod: 'PUT',
+      },
     ]);
+  });
+
+  it('uses PATCH as the update method when the item path only offers patch', () => {
+    const resources = discoverResources({
+      '/repos/{owner}/{repo}/issues': { post: {}, get: {} },
+      '/repos/{owner}/{repo}/issues/{issue_number}': { get: {}, patch: {} },
+    });
+
+    expect(resources[0]?.updateMethod).toBe('PATCH');
+  });
+
+  it('prefers PUT when the item path declares both put and patch', () => {
+    const resources = discoverResources({
+      '/calendars': {},
+      '/calendars/{calendarId}': { put: {}, patch: {} },
+    });
+
+    expect(resources[0]?.updateMethod).toBe('PUT');
   });
 
   it('omits paths that have no matching item path', () => {

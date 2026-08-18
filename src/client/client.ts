@@ -32,6 +32,15 @@ export interface ApiClientOptions {
   storage?: StorageAdapter;
   fetch?: typeof fetch;
   retry?: RetryOptions;
+  /**
+   * Record property that holds a resource's identity — the value used as the
+   * local storage key, read back from a create response to reconcile the
+   * server-assigned id, and substituted into the item URL's path variable.
+   * Defaults to `id`. Set this when the API addresses a resource by a
+   * different field (e.g. GitHub issues are keyed by `number`, not the
+   * global `id` the payload also carries).
+   */
+  identityField?: string;
 }
 
 export interface PaginateOptions {
@@ -173,15 +182,16 @@ function itemFingerprint(item: Record<string, unknown>): string {
 function hasChanges(
   previous: Record<string, unknown>[] | undefined,
   next: Record<string, unknown>[],
+  idField: string,
 ): boolean {
   if (!previous || previous.length !== next.length) {
     return true;
   }
   const previousById = new Map(
-    previous.map((item) => [String(item['id']), item]),
+    previous.map((item) => [String(item[idField]), item]),
   );
   return next.some((item) => {
-    const match = previousById.get(String(item['id']));
+    const match = previousById.get(String(item[idField]));
     return !match || itemFingerprint(match) !== itemFingerprint(item);
   });
 }
@@ -233,6 +243,7 @@ export function createApiClient(
 ): ApiClient {
   const storage = options.storage ?? new InMemoryStorageAdapter();
   const fetchImpl = options.fetch ?? fetch;
+  const idField = options.identityField ?? 'id';
   const routes = discoverResources(document.paths);
   const byResource = new Map(
     routes.map((route) => [route.collectionPath, route]),
@@ -291,7 +302,7 @@ export function createApiClient(
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(write.data),
         })) as Record<string, unknown>;
-        const resolvedId = String(created['id']);
+        const resolvedId = String(created[idField]);
         if (resolvedId !== write.id) {
           await storage.delete(write.resource, write.id);
         }
@@ -302,7 +313,7 @@ export function createApiClient(
       if (write.type === 'update') {
         const route = resolveRoute(write.resource);
         const updated = (await requestJson(itemUrl(route, write.id), {
-          method: 'PUT',
+          method: route.updateMethod,
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(write.data),
         })) as Record<string, unknown>;
@@ -568,7 +579,13 @@ export function createApiClient(
       }
 
       const { body, headers } = await requestJsonWithHeaders(url);
-      const pageItems = itemsField ? body[itemsField] : undefined;
+      // A top-level array body is itself the page of items (mirrors the
+      // non-paginated path); otherwise the items live under `itemsField`.
+      const pageItems = Array.isArray(body)
+        ? (body as Record<string, unknown>[])
+        : itemsField
+          ? body[itemsField]
+          : undefined;
       if (Array.isArray(pageItems)) {
         items.push(...(pageItems as Record<string, unknown>[]));
       }
@@ -634,15 +651,15 @@ export function createApiClient(
       }
 
       const previous = lastSyncedItems.get(route.collectionPath);
-      if (hasChanges(previous, items)) {
+      if (hasChanges(previous, items, idField)) {
         changed.push(route.collectionPath);
         for (const item of items) {
-          await storage.put(route.collectionPath, String(item['id']), item);
+          await storage.put(route.collectionPath, String(item[idField]), item);
         }
         if (previous) {
-          const nextIds = new Set(items.map((item) => String(item['id'])));
+          const nextIds = new Set(items.map((item) => String(item[idField])));
           for (const staleItem of previous) {
-            const staleId = String(staleItem['id']);
+            const staleId = String(staleItem[idField]);
             if (!nextIds.has(staleId)) {
               await storage.delete(route.collectionPath, staleId);
             }
@@ -701,8 +718,10 @@ export function createApiClient(
     async create(resource, data): Promise<Record<string, unknown>> {
       const route = resolveRoute(resource);
       const id =
-        typeof data['id'] === 'string' ? data['id'] : crypto.randomUUID();
-      const record = { ...data, id };
+        typeof data[idField] === 'string'
+          ? (data[idField] as string)
+          : crypto.randomUUID();
+      const record = { ...data, [idField]: id };
       await storage.put(route.collectionPath, id, record);
       enqueueWrite({
         resource: route.collectionPath,
@@ -716,7 +735,7 @@ export function createApiClient(
     async update(resource, id, data): Promise<Record<string, unknown>> {
       const route = resolveRoute(resource);
       const existing = await storage.get(route.collectionPath, id);
-      const record = { ...existing, ...data, id };
+      const record = { ...existing, ...data, [idField]: id };
       await storage.put(route.collectionPath, id, record);
       enqueueWrite({
         resource: route.collectionPath,

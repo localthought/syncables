@@ -44,7 +44,12 @@ describe('acceptance: giphy.com (apis.guru)', () => {
 
   it('discovers /gifs as the only resource', () => {
     expect(discoverResources(document.paths)).toEqual([
-      { collectionPath: '/gifs', itemPath: '/gifs/{gifId}', itemParam: 'gifId' },
+      {
+        collectionPath: '/gifs',
+        itemPath: '/gifs/{gifId}',
+        itemParam: 'gifId',
+        updateMethod: 'PUT',
+      },
     ]);
   });
 
