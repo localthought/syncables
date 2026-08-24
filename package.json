@@ -1,6 +1,6 @@
 {
   "name": "syncables",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "Reads an OpenAPI document to run a mock API server and a client that syncs a local copy of the API's dataset.",
   "type": "module",
   "main": "build/src/index.js",
@@ -46,7 +46,8 @@
     "test:coverage": "vitest run unit --config __tests__/vitest.config.ts --coverage.enabled --coverage.all",
     "prettier": "prettier \"{src,__{tests}__}/**/*.{ts,mts}\" --config .prettierrc --write",
     "prettier:check": "prettier \"{src,__{tests}__}/**/*.{ts,mts}\" --config .prettierrc --check",
-    "test:watch": "vitest unit"
+    "test:watch": "vitest unit",
+    "prepare": "npm run build:release"
   },
   "author": "Michiel de Jong <michiel@unhosted.org>",
   "license": "Apache-2.0",
