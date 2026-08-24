@@ -67,6 +67,24 @@ Data flows through four stages, each its own directory under `src/`:
    actions) are not resources and are handled separately as raw
    request/response passthroughs.
 
+   Path parameters belonging to the *collection* itself (as opposed to the
+   item id) aren't substituted anywhere downstream: `client.ts`'s
+   `collectionUrl`/`itemUrl` only fill in `itemParam`, so a nested resource
+   like GitHub's `/repos/{owner}/{repo}/issues` would be requested with
+   `{owner}`/`{repo}` still literally in the URL; the mock server's
+   `ResourceStore` also keys collections by the raw path template, so every
+   `{owner}`/`{repo}` combination would collide into one shared collection.
+   The current model only really supports resources at a fixed,
+   parameter-free collection path.
+
+   A sibling spec, the [OpenAPI CRUD Causality Extension](https://github.com/pondersource/openapi-extensions/tree/main/spec/crud-causality)
+   (`components.crudResources`, `x-crud`), formalizes a superset of this —
+   multiple collections per resource, server-added fields, and (via
+   `identity.bindings`) exactly the collection-path-parameter carryover
+   described above — and names this project as its intended reference
+   implementation. It isn't implemented here yet; `discoverResources`'s
+   pairing is a narrower, ad hoc stand-in for it.
+
 3. **`mock-server/`** — `server.ts` is the request handler; it uses
    `routing/router.ts` (`findRoute`) to match an incoming path against the
    OpenAPI path templates. For a GET operation, it first checks whether a
@@ -80,7 +98,12 @@ Data flows through four stages, each its own directory under `src/`:
 
 4. **`client/`** — `client.ts`'s `createApiClient` also runs `discoverResources`
    against the same document to know what resources/routes exist, then talks
-   to a live server over `fetch`. Reads are served from local storage
+   to a live server over `fetch`. Nothing in this package reads an OpenAPI
+   document's `security`/`securitySchemes` (not even present in `types.ts`'s
+   type surface) — there's no built-in notion of auth. `ApiClientOptions.fetch`
+   is the only extension point, so authenticating (a bearer token, an API
+   key from an env var, etc.) means passing a `fetch` wrapper that adds the
+   right header to every request. Reads are served from local storage
    (`StorageAdapter`, `storage.ts`; `InMemoryStorageAdapter` is the default —
    pass a custom adapter to persist elsewhere). `sync()` and the standalone
    `paginate()` method both walk every page of a paginated GET operation
@@ -100,7 +123,9 @@ Data flows through four stages, each its own directory under `src/`:
    when present, which is common enough in real APIs that this rarely
    triggers). `pendingWrites()` reports writes not yet confirmed by the
    server, including the last error and attempt count for ones currently
-   failing.
+   failing. `update()` always sends a `PUT` (full replace) — there's no
+   `PATCH`/partial-update path on the client, even though the mock server's
+   `handleItemRequest` accepts both.
 
    `sync()` is meant to be called repeatedly (`startPolling({ intervalMs })`
    does this on an interval, skipping a tick if the previous sync is still
@@ -147,6 +172,13 @@ dot-path targets like `$.components`, not the full JSONPath grammar).
   first, else auto-detection by matching the scheme's declared query
   parameter/body field names against the operation's own (§6.2 default
   rules — a dimension with zero declared fields never vacuously matches).
+  Only the query-parameter and body-field dimensions are actually
+  implemented — `AutoDetectObject.matchHeaders`/`matchResponseFields` and
+  `RequestPaginationFieldsObject.headerFields` are part of the type surface
+  (mirroring the spec) but nothing reads them yet, so a scheme that can only
+  be auto-detected via a request/response header (e.g. a `Link`-header
+  `nextLink` scheme, like GitHub's) needs an explicit `x-pagination` entry
+  until that's implemented.
 - `items.ts` locates which top-level response property actually holds the
   list of items — the extension itself only describes pagination metadata,
   not where items live, so this excludes whatever fields the scheme claims
