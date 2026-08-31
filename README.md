@@ -67,6 +67,23 @@ const pet = await client.create('/pets', { name: 'Milo', tag: 'cat' });
 client.pendingWrites('/pets'); // writes not yet confirmed by the server
 ```
 
+## NLnet milestone 1
+
+This package is the reference implementation for
+[milestone 1](https://github.com/tubsproject/syncables/blob/main/nlnet-milestones.md#1-syncables)
+of the project's NLnet grant, which is split into two parts:
+
+- **Part a) Read-only version** — `createApiClient`'s [`sync()`/`paginate()`](#keeping-in-sync)
+  pull a full local-first copy of a resource collection (walking pagination in
+  full, then re-fetching conditionally on later calls) into a pluggable
+  `StorageAdapter`, from nothing but the OpenAPI document — see `discoverResources`
+  (`src/resources/discover.ts`) for how "syncable" resources are found in it.
+- **Part b) Full bidirectional version** — the [`create`/`update`/`remove`](#writing)
+  methods make that copy writable, not just readable: each write lands in local
+  storage immediately, then applies itself against the server in the background
+  through a per-record retry queue (`src/client/client.ts`), so the local
+  copy can be both pulled *and* pushed, as the milestone describes.
+
 ## Generative AI use
 
 syncables is developed collaboratively with **Claude Code** (Anthropic), an
