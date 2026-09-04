@@ -1,5 +1,11 @@
 # syncables
 
+This code is open source and was produced by Michiel de Jong, using Claude as a tool.
+Michiel de Jong has signed off on all the code in this repo line-by-line (except for
+the lockfiles, which were produced by npm and pnpm),and Michiel de Jong is the
+publishing author in terms of copyright.
+This work was [funded by NLNet](https://nlnet.nl/project/TUBS/).
+
 Reads an OpenAPI document and gives you:
 
 - a **mock API server** that implements it, backed by a real (in-memory)
